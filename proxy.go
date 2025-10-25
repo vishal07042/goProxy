@@ -164,25 +164,28 @@ func isNSFW(imageBytes []byte) (bool, error) {
 		return false, err
 	}
 
-	// Preprocess: Resize to 640x640 for YOLO-based NudeNet (adjust if model differs)
-	resized := imaging.Resize(img, 640, 640, imaging.Lanczos)
+	// Preprocess: Resize to 320x320 for NudeNet (adjust if model differs)
+	// Changed from 640x640 to 320x320 to match model expectations
+	resized := imaging.Resize(img, 320, 320, imaging.Lanczos)
 	rgba := image.NewRGBA(resized.Bounds())
 	draw.Draw(rgba, rgba.Bounds(), resized, image.Point{}, draw.Src)
 
 	// Prepare input: CHW, float32 [0,255]
-	inputData := make([]float32, 3*640*640)
-	for y := 0; y < 640; y++ {
-		for x := 0; x < 640; x++ {
+	// Changed dimensions from 640x640 to 320x320
+	inputData := make([]float32, 3*320*320)
+	for y := 0; y < 320; y++ {
+		for x := 0; x < 320; x++ {
 			r, g, b, _ := rgba.At(x, y).RGBA()
 			// CHW order
-			inputData[(0*640+y)*640+x] = float32(r >> 8) // R
-			inputData[(1*640+y)*640+x] = float32(g >> 8) // G
-			inputData[(2*640+y)*640+x] = float32(b >> 8) // B
+			inputData[(0*320+y)*320+x] = float32(r >> 8) // R
+			inputData[(1*320+y)*320+x] = float32(g >> 8) // G
+			inputData[(2*320+y)*320+x] = float32(b >> 8) // B
 		}
 	}
 
 	// Create tensors
-	inputShape := ort.NewShape(1, 3, 640, 640)
+	// Changed input shape from [1, 3, 640, 640] to [1, 3, 320, 320]
+	inputShape := ort.NewShape(1, 3, 320, 320)
 	inputTensor, err := ort.NewTensor[float32](inputShape, inputData)
 	if err != nil {
 		log.Printf("Failed to create input tensor: %v", err)
@@ -191,6 +194,7 @@ func isNSFW(imageBytes []byte) (bool, error) {
 	defer inputTensor.Destroy()
 
 	// For detection, output shape is typically [1, 25200, 85] for YOLOv8
+	// This should remain the same regardless of input size
 	outputShape := ort.NewShape(1, 25200, 85)
 	outputData := make([]float32, 1*25200*85)
 	outputTensor, err := ort.NewTensor[float32](outputShape, outputData)
@@ -217,17 +221,25 @@ func isNSFW(imageBytes []byte) (bool, error) {
 	probs := outputTensor.GetData()
 	log.Printf("NudeNet Output Shape: len=%d", len(probs))
 
-	// For detection, parse bounding boxes and classes; flag if any explicit class conf > 0.5
-	// Simplified: Check if any conf > 0.5 for explicit classes (indices 5+ for classes)
+	// For detection, parse bounding boxes and classes; flag if any explicit class conf > 0.3 (lowered from 0.5)
+	// Simplified: Check if any conf > 0.3 for explicit classes (indices 5+ for classes)
 	isNsfw := false
+	maxConf := float32(0.0)
 	for i := 0; i < len(probs); i += 85 {
 		conf := probs[i+4] // Conf index
-		if conf > 0.5 {
+		if conf > maxConf {
+			maxConf = conf
+		}
+		if conf > 0.3 { // Lowered from 0.5
 			// Check class indices 5 to 84 for explicit (e.g., map to labels)
 			for j := 5; j < 85; j++ {
 				classConf := probs[i+j]
-				if classConf > 0.5 { // Adjust for explicit classes
+				if classConf > maxConf {
+					maxConf = classConf
+				}
+				if classConf > 0.3 { // Lowered from 0.5
 					isNsfw = true
+					log.Printf("NSFW detected - Object confidence: %.2f, Class confidence: %.2f", conf, classConf)
 					break
 				}
 			}
@@ -237,7 +249,7 @@ func isNSFW(imageBytes []byte) (bool, error) {
 		}
 	}
 
-	log.Printf("NudeNet NSFW: %v", isNsfw)
+	log.Printf("NudeNet NSFW: %v, Max confidence: %.2f", isNsfw, maxConf)
 	return isNsfw, nil
 }
 
@@ -371,6 +383,7 @@ func main() {
 				}
 			}
 		} else if strings.HasPrefix(contentType, "image/") {
+			log.Printf("🔍 Processing image from %s (%d bytes, type: %s)", ctx.Req.URL.Host, len(body), contentType)
 			isNsfw, err := isNSFW(body)
 			if err != nil {
 				log.Printf("NSFW check error for %s: %v", ctx.Req.URL, err)
@@ -379,7 +392,7 @@ func main() {
 			if isNsfw {
 				newBody, err := blurImage(body, contentType)
 				if err != nil {
-					log.Printf("Blur error for %s: %v", ctx.Req.URL, err)
+					log.Printf("❌ Blur error for %s: %v", ctx.Req.URL, err)
 				} else {
 					body = newBody
 					log.Printf("🔒 Blurred NSFW image from %s", ctx.Req.URL)
@@ -394,10 +407,6 @@ func main() {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp
 	})
-
-	
-	
-
 
 	log.Println("Starting HTTPS Filter Proxy on :8080")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", proxy))
