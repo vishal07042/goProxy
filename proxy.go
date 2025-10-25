@@ -8,6 +8,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
+	"image"
+	"image/draw"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"math/big"
@@ -17,23 +23,24 @@ import (
 	"strings"
 	"time"
 
+	ort "github.com/yalue/onnxruntime_go"
+
+	"github.com/disintegration/imaging"
 	"github.com/elazarl/goproxy"
 )
 
+// generateCA function to generate a self-signed CA certificate
 func generateCA() (tls.Certificate, error) {
-	// Generate private key
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
-	// Generate a random serial number
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
-	// Certificate template with proper CA settings
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -45,8 +52,8 @@ func generateCA() (tls.Certificate, error) {
 			PostalCode:    []string{""},
 			CommonName:    "HTTPS Filter Proxy CA",
 		},
-		NotBefore:             time.Now().Add(-24 * time.Hour), // Valid from yesterday
-		NotAfter:              time.Now().AddDate(10, 0, 0),    // Valid for 10 years
+		NotBefore:             time.Now().Add(-24 * time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
@@ -55,28 +62,23 @@ func generateCA() (tls.Certificate, error) {
 		MaxPathLenZero:        false,
 	}
 
-	// Self-sign the certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
-	// Encode certificate to PEM
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	// Encode private key to PEM
 	keyPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
 	})
 
-	// Save certificate PEM to file
 	err = os.WriteFile("https-filter-ca.pem", certPEM, 0644)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 
-	// Save key PEM to file (for backup)
 	err = os.WriteFile("https-filter-ca-key.pem", keyPEM, 0600)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -90,7 +92,6 @@ func generateCA() (tls.Certificate, error) {
 	log.Println("  Or: Double-click https-filter-ca.pem -> Install Certificate -> Local Machine -> Trusted Root Certification Authorities")
 	log.Println("")
 
-	// Create tls.Certificate from PEM
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -99,13 +100,185 @@ func generateCA() (tls.Certificate, error) {
 	return tlsCert, nil
 }
 
-func main() {
-	// Check if CA already exists
-	var caCert tls.Certificate
+var inputName string = "images" // Typical for YOLO-based NudeNet; confirm with Netron if needed
+var outputName string = "output0"
+var nudenetEnabled bool = false
+
+var nudenetLabels = []string{
+	"SEXY", "FEMALE_GENITALIA", "FEMALE_BREAST", "FEMALE_BUTTOCKS",
+	"MALE_GENITALIA", "MALE_CHEST", "FEMALE_FLESH", "MALE_FLESH",
+	"FEET", "FACE", "SEXUAL_ACT", "LINGERIE", "SWIMWEAR",
+}
+
+func initNudeNetONNX() error {
+	// Get current working directory
+	dir, _ := os.Getwd()
+	dllPath := dir + "\\onnxruntime.dll"
 	
+	log.Println("Attempting to initialize ONNX Runtime...")
+	log.Printf("Current working directory: %s", dir)
+	log.Printf("Attempting to load DLL from: %s", dllPath)
+	
+	// Check if the DLL file exists
+	if _, err := os.Stat(dllPath); err != nil {
+		log.Printf("ONNX Runtime DLL not found at: %s", dllPath)
+		return fmt.Errorf("ONNX Runtime DLL not found at: %s", dllPath)
+	} else {
+		log.Println("ONNX Runtime DLL found")
+	}
+	
+	// Set the DLL path explicitly
+	ort.SetSharedLibraryPath(dllPath)
+	log.Printf("Set DLL path to: %s", dllPath)
+
+	// Initialize environment with error handling
+	if err := ort.InitializeEnvironment(); err != nil {
+		log.Printf("ONNX Runtime initialization failed: %v", err)
+		log.Println("Images will pass through without filtering.")
+		nudenetEnabled = false
+		return fmt.Errorf("ONNX Runtime initialization failed: %v", err)
+	}
+
+	// Check if model exists
+	modelPath := "./nudenet.onnx"
+	if _, err := os.Stat(modelPath); err != nil {
+		log.Printf("NudeNet model not found: %s", modelPath)
+		log.Println("Images will pass through without filtering.")
+		nudenetEnabled = false
+		return fmt.Errorf("NudeNet model not found: %s", modelPath)
+	}
+
+	nudenetEnabled = true
+	log.Println("✓ NudeNet ONNX environment initialized successfully")
+	return nil
+}
+
+func isNSFW(imageBytes []byte) (bool, error) {
+	if !nudenetEnabled {
+		return false, nil // Skip NSFW detection if not enabled
+	}
+
+	// Decode image
+	img, _, err := image.Decode(bytes.NewReader(imageBytes))
+	if err != nil {
+		return false, err
+	}
+
+	// Preprocess: Resize to 640x640 for YOLO-based NudeNet (adjust if model differs)
+	resized := imaging.Resize(img, 640, 640, imaging.Lanczos)
+	rgba := image.NewRGBA(resized.Bounds())
+	draw.Draw(rgba, rgba.Bounds(), resized, image.Point{}, draw.Src)
+
+	// Prepare input: CHW, float32 [0,255]
+	inputData := make([]float32, 3*640*640)
+	for y := 0; y < 640; y++ {
+		for x := 0; x < 640; x++ {
+			r, g, b, _ := rgba.At(x, y).RGBA()
+			// CHW order
+			inputData[(0*640+y)*640+x] = float32(r >> 8) // R
+			inputData[(1*640+y)*640+x] = float32(g >> 8) // G
+			inputData[(2*640+y)*640+x] = float32(b >> 8) // B
+		}
+	}
+
+	// Create tensors
+	inputShape := ort.NewShape(1, 3, 640, 640)
+	inputTensor, err := ort.NewTensor[float32](inputShape, inputData)
+	if err != nil {
+		log.Printf("Failed to create input tensor: %v", err)
+		return false, nil // Fall back to not filtering
+	}
+	defer inputTensor.Destroy()
+
+	// For detection, output shape is typically [1, 25200, 85] for YOLOv8
+	outputShape := ort.NewShape(1, 25200, 85)
+	outputData := make([]float32, 1*25200*85)
+	outputTensor, err := ort.NewTensor[float32](outputShape, outputData)
+	if err != nil {
+		log.Printf("Failed to create output tensor: %v", err)
+		return false, nil // Fall back to not filtering
+	}
+	defer outputTensor.Destroy()
+
+	// Create new session with actual tensors
+	session, err := ort.NewSession[float32]("./nudenet.onnx", []string{inputName}, []string{outputName}, []*ort.Tensor[float32]{inputTensor}, []*ort.Tensor[float32]{outputTensor})
+	if err != nil {
+		log.Printf("Failed to create ONNX session: %v", err)
+		return false, nil // Fall back to not filtering
+	}
+	defer session.Destroy()
+
+	// Run inference
+	if err := session.Run(); err != nil {
+		log.Printf("ONNX inference failed: %v", err)
+		return false, nil // Fall back to not filtering
+	}
+
+	probs := outputTensor.GetData()
+	log.Printf("NudeNet Output Shape: len=%d", len(probs))
+
+	// For detection, parse bounding boxes and classes; flag if any explicit class conf > 0.5
+	// Simplified: Check if any conf > 0.5 for explicit classes (indices 5+ for classes)
+	isNsfw := false
+	for i := 0; i < len(probs); i += 85 {
+		conf := probs[i+4] // Conf index
+		if conf > 0.5 {
+			// Check class indices 5 to 84 for explicit (e.g., map to labels)
+			for j := 5; j < 85; j++ {
+				classConf := probs[i+j]
+				if classConf > 0.5 { // Adjust for explicit classes
+					isNsfw = true
+					break
+				}
+			}
+			if isNsfw {
+				break
+			}
+		}
+	}
+
+	log.Printf("NudeNet NSFW: %v", isNsfw)
+	return isNsfw, nil
+}
+
+func blurImage(imageBytes []byte, contentType string) ([]byte, error) {
+	format := strings.TrimPrefix(contentType, "image/")
+	format = strings.TrimSuffix(format, ";")
+
+	img, _, err := image.Decode(bytes.NewReader(imageBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	blurred := imaging.Blur(img, 20.0)
+
+	var buf bytes.Buffer
+	var encErr error
+	switch format {
+	case "jpeg", "jpg":
+		encErr = imaging.Encode(&buf, blurred, imaging.JPEG, imaging.JPEGQuality(90))
+	case "png":
+		encErr = imaging.Encode(&buf, blurred, imaging.PNG)
+	case "gif":
+		encErr = imaging.Encode(&buf, blurred, imaging.GIF)
+	default:
+		return nil, fmt.Errorf("unsupported image format: %s", format)
+	}
+
+	if encErr != nil {
+		return nil, encErr
+	}
+
+	return buf.Bytes(), nil
+}
+
+func main() {
+	log.Println("Starting HTTPS Filter Proxy...")
+	
+	// CA setup
+	var caCert tls.Certificate
 
 	if _, err := os.Stat("https-filter-ca.pem"); err == nil {
-		// Load existing CA
 		log.Println("Loading existing CA certificate...")
 		certPEM, err := os.ReadFile("https-filter-ca.pem")
 		if err != nil {
@@ -121,32 +294,38 @@ func main() {
 		}
 		log.Println("✓ Loaded existing CA certificate")
 	} else {
-		// Generate new CA
 		log.Println("Generating new CA certificate...")
+		var err error
 		caCert, err = generateCA()
 		if err != nil {
 			log.Fatal("Failed to generate CA: ", err)
 		}
 	}
 
-	// Set the CA for MITM
 	goproxy.GoproxyCa = caCert
+
+	// Init NudeNet ONNX
+	log.Println("Initializing NudeNet ONNX...")
+	if err := initNudeNetONNX(); err != nil {
+		log.Printf("Warning: %v", err)
+		log.Println("Images will pass through without filtering.")
+		nudenetEnabled = false
+	} else {
+		log.Println("NudeNet ONNX initialized successfully")
+	}
 
 	// Create proxy
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
 
-	// Enable HTTPS MITM for all connections
+	// Enable HTTPS MITM
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 
-	// Block specific domains
+	// Block domains
 	blockedDomains := regexp.MustCompile(`(example\.com|blocked-site\.com)`)
 
-	// Block HTTPS connections to blocked domains
-	proxy.OnRequest(goproxy.ReqHostMatches(blockedDomains)).
-		HandleConnect(goproxy.AlwaysReject)
+	proxy.OnRequest(goproxy.ReqHostMatches(blockedDomains)).HandleConnect(goproxy.AlwaysReject)
 
-	// Block HTTP requests to blocked domains
 	proxy.OnRequest(goproxy.ReqHostMatches(blockedDomains)).DoFunc(
 		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 			log.Printf("❌ Blocked request to: %s", req.URL.Host)
@@ -155,60 +334,71 @@ func main() {
 				`<html><body><h1>Access Denied</h1><p>This site is blocked by HTTPS Filter Proxy.</p></body></html>`)
 		})
 
-	// Log all HTTPS requests (after MITM)
+	// Log requests
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		log.Printf("→ Request: %s %s", req.Method, req.URL.String())
 		return req, nil
 	})
 
-	// Filter responses by keyword and content
+	// Response filter: keywords + NudeNet blurring
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp == nil {
 			return resp
 		}
 
 		contentType := resp.Header.Get("Content-Type")
-		if !strings.Contains(contentType, "text") && !strings.Contains(contentType, "application/json") {
-			return resp
+		if contentType == "" {
+			contentType = "application/octet-stream"
 		}
 
-		// Read response body
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Printf("Error reading response body: %v", err)
+			resp.Body.Close()
 			return resp
 		}
 		resp.Body.Close()
 
 		bodyStr := string(body)
-
-		// Check for blocked keywords
-		blockedKeywords := []string{"vulture", "bullrun", "eagle"}
-		for _, keyword := range blockedKeywords {
-			if strings.Contains(strings.ToLower(bodyStr), keyword) {
-				log.Printf("❌ Blocked response from %s - contains keyword: %s", ctx.Req.URL, keyword)
-				return goproxy.NewResponse(ctx.Req,
-					goproxy.ContentTypeHtml, http.StatusForbidden,
-					`<html><body><h1>Content Blocked</h1><p>This content was blocked due to prohibited keywords.</p></body></html>`)
+		if strings.Contains(contentType, "text") || strings.Contains(contentType, "application/json") {
+			blockedKeywords := []string{"vulture", "bullrun", "eagle"}
+			for _, keyword := range blockedKeywords {
+				if strings.Contains(strings.ToLower(bodyStr), keyword) {
+					log.Printf("❌ Blocked response from %s - contains keyword: %s", ctx.Req.URL, keyword)
+					return goproxy.NewResponse(ctx.Req,
+						goproxy.ContentTypeHtml, http.StatusForbidden,
+						`<html><body><h1>Content Blocked</h1><p>This content was blocked due to prohibited keywords.</p></body></html>`)
+				}
 			}
+		} else if strings.HasPrefix(contentType, "image/") {
+			isNsfw, err := isNSFW(body)
+			if err != nil {
+				log.Printf("NSFW check error for %s: %v", ctx.Req.URL, err)
+				isNsfw = false
+			}
+			if isNsfw {
+				newBody, err := blurImage(body, contentType)
+				if err != nil {
+					log.Printf("Blur error for %s: %v", ctx.Req.URL, err)
+				} else {
+					body = newBody
+					log.Printf("🔒 Blurred NSFW image from %s", ctx.Req.URL)
+				}
+			} else {
+				log.Printf("✓ Safe image from %s (%d bytes)", ctx.Req.URL.Host, len(body))
+			}
+		} else {
+			log.Printf("✓ Passed through non-text/image from %s (%d bytes)", ctx.Req.URL.Host, len(body))
 		}
 
-		// Reconstruct response body
 		resp.Body = io.NopCloser(bytes.NewReader(body))
-		log.Printf("✓ Response from %s (%d bytes)", ctx.Req.URL.Host, len(body))
 		return resp
 	})
 
-	// Start proxy
-	log.Println("")
-	log.Println("========================================")
-	log.Println("HTTPS Filter Proxy Server")
-	log.Println("========================================")
-	log.Println("Listening on: http://localhost:8080")
-	log.Println("Blocked domains: example.com, blocked-site.com")
-	log.Println("Blocked keywords: spam, malware, phishing")
-	log.Println("========================================")
-	log.Println("")
+	
+	
 
-	log.Fatal(http.ListenAndServe("0.0.0.0:8080", proxy))
+
+	log.Println("Starting HTTPS Filter Proxy on :8080")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", proxy))
 }
